@@ -44,7 +44,7 @@ namespace esekfom
 
 		state_ikfom get_x()
 		{
-			return x_;
+			return x_; //论文公式(3)中的x
 		}
 
 		cov get_P()
@@ -110,7 +110,7 @@ namespace esekfom
 			for (int i = 0; i < feats_down_size; i++) //遍历所有的特征点
 			{
 				PointType &point_body = feats_down_body->points[i];
-				PointType point_world;
+				PointType point_world; // 特征点在世界坐标系下的坐标
 
 				V3D p_body(point_body.x, point_body.y, point_body.z);
 				//把Lidar坐标系的点先转到IMU坐标系，再根据前向传播估计的位姿x，转到世界坐标系
@@ -124,20 +124,22 @@ namespace esekfom
 				auto &points_near = Nearest_Points[i]; // Nearest_Points[i]打印出来发现是按照离point_world距离，从小到大的顺序的vector
 
 				double ta = omp_get_wtime();
-				if (ekfom_data.converge)
+				if (ekfom_data.converge)// 三个点就能确定一个平面，但是这里使用了5个点(经验值)为了减少误差
 				{
 					//寻找point_world的最近邻的平面点
 					ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
 					//判断是否是有效匹配点，与loam系列类似，要求特征点最近邻的地图点数量>阈值，距离<阈值  满足条件的才置为true
+					//5个点都满足距离<阈值，说明5个点都聚在一个邻域里，这一小块邻域可能是一张连续的平面
 					point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false
 																																		: true;
 				}
 				if (!point_selected_surf[i])
 					continue; //如果该点不满足条件  不进行下面步骤
-
+				
+				/** 说明该点是有效点，接下来计算这个点与平面的残差 **/
 				Matrix<float, 4, 1> pabcd;		//平面点信息
 				point_selected_surf[i] = false; //将该点设置为无效点，用来判断是否满足条件
-				//拟合平面方程ax+by+cz+d=0并求解点到平面距离
+				//拟合平面方程ax+by+cz+d=0并求解点到平面距离(残差)
 				if (esti_plane(pabcd, points_near, 0.1f))
 				{
 					float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3); //当前点到平面的距离
@@ -159,6 +161,7 @@ namespace esekfom
 			{
 				if (point_selected_surf[i]) //对于满足要求的点
 				{
+					//存储有效特征点以及对应的法向量
 					laserCloudOri->points[effct_feat_num] = feats_down_body->points[i]; //把这些点重新存到laserCloudOri中
 					corr_normvect->points[effct_feat_num] = normvec->points[i];			//存储这些点对应的法向量和到平面的距离
 					effct_feat_num++;
@@ -173,17 +176,17 @@ namespace esekfom
 			}
 
 			// 雅可比矩阵H和残差向量的计算
-			ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12);
-			ekfom_data.h.resize(effct_feat_num);
+			ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); // H矩阵，为什么是12维？
+			ekfom_data.h.resize(effct_feat_num); // 残差
 
 			for (int i = 0; i < effct_feat_num; i++)
 			{
 				V3D point_(laserCloudOri->points[i].x, laserCloudOri->points[i].y, laserCloudOri->points[i].z);
 				M3D point_crossmat;
-				point_crossmat << SKEW_SYM_MATRX(point_);
-				V3D point_I_ = x_.offset_R_L_I * point_ + x_.offset_T_L_I;
+				point_crossmat << SKEW_SYM_MATRX(point_); //映射为反对称矩阵
+				V3D point_I_ = x_.offset_R_L_I * point_ + x_.offset_T_L_I;//将特征点转到IMU坐标系下
 				M3D point_I_crossmat;
-				point_I_crossmat << SKEW_SYM_MATRX(point_I_);
+				point_I_crossmat << SKEW_SYM_MATRX(point_I_); //映射为反对称矩阵
 
 				// 得到对应的平面的法向量
 				const PointType &norm_p = corr_normvect->points[i];
@@ -192,7 +195,7 @@ namespace esekfom
 				// 计算雅可比矩阵H
 				V3D C(x_.rot.matrix().transpose() * norm_vec);
 				V3D A(point_I_crossmat * C);
-				if (extrinsic_est)
+				if (extrinsic_est) //外参估计
 				{
 					V3D B(point_crossmat * x_.offset_R_L_I.matrix().transpose() * C);
 					ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
@@ -202,7 +205,8 @@ namespace esekfom
 					ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
 				}
 
-				//残差：点面距离
+				//残差：点面距离，intensity在此处充当残差的存储
+				//此处添加负号是在公式18中广义加后半部分有个负号
 				ekfom_data.h(i) = -norm_p.intensity;
 			}
 		}
@@ -230,16 +234,16 @@ namespace esekfom
 		void update_iterated_dyn_share_modified(double R, PointCloudXYZI::Ptr &feats_down_body,
 												KD_TREE<PointType> &ikdtree, vector<PointVector> &Nearest_Points, int maximum_iter, bool extrinsic_est)
 		{
-			normvec->resize(int(feats_down_body->points.size()));
+			normvec->resize(int(feats_down_body->points.size())); // 存放平面的法向量和到平面的距离
 
-			dyn_share_datastruct dyn_share;
+			dyn_share_datastruct dyn_share; // 此结构体内含公式14中的z和H矩阵(残差和雅可比矩阵)
 			dyn_share.valid = true;
 			dyn_share.converge = true;
 			int t = 0;
 			state_ikfom x_propagated = x_; //这里的x_和P_分别是经过正向传播后的状态量和协方差矩阵，因为会先调用predict函数再调用这个函数
 			cov P_propagated = P_;
 
-			vectorized_state dx_new = vectorized_state::Zero(); // 24X1的向量
+			vectorized_state dx_new = vectorized_state::Zero(); // 24X1的向量，表示公式18中广义加后部分
 
 			for (int i = -1; i < maximum_iter; i++) // maximum_iter是卡尔曼滤波的最大迭代次数
 			{
@@ -260,7 +264,7 @@ namespace esekfom
 				Eigen::Matrix<double, 24, 24> HTH = Matrix<double, 24, 24>::Zero(); //矩阵 H^T * H
 				HTH.block<12, 12>(0, 0) = H.transpose() * H;
 
-				auto K_front = (HTH / R + P_.inverse()).inverse();
+				auto K_front = (HTH / R + P_.inverse()).inverse();// 公式(20)中K的前半部分
 				Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> K;
 				K = K_front.block<24, 12>(0, 0) * H.transpose() / R; //卡尔曼增益  这里R视为常数
 
@@ -273,6 +277,8 @@ namespace esekfom
 				dyn_share.converge = true;
 				for (int j = 0; j < 24; j++)
 				{
+					//论文中是判断广义减之后的绝对值小于epsi
+					//(x⊞δ)⊟x≈δ，这里判断dx的绝对值是否大于epsi
 					if (std::fabs(dx_[j]) > epsi) //如果dx>epsi 认为没有收敛
 					{
 						dyn_share.converge = false;

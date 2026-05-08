@@ -19,7 +19,7 @@ using namespace Eigen;
 
 #define VEC_FROM_ARRAY(v)        v[0],v[1],v[2]
 #define MAT_FROM_ARRAY(v)        v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]
-#define SKEW_SYM_MATRX(v)        0.0,-v[2],v[1],v[2],0.0,-v[0],-v[1],v[0],0.0
+#define SKEW_SYM_MATRX(v)        0.0,-v[2],v[1],v[2],0.0,-v[0],-v[1],v[0],0.0 //反对称矩阵
 #define DEBUG_FILE_DIR(name)     (string(string(ROOT_DIR) + "Log/"+ name))
 
 typedef sfast_lio::Pose6D Pose6D;
@@ -73,6 +73,7 @@ float calc_dist(PointType p1, PointType p2){
 }
 
 template<typename T>
+// 我用这 5 个点拟合出的平面，回过头量一下这 5 个点自己，看它们是不是真的都贴在这张平面上
 bool esti_plane(Matrix<T, 4, 1> &pca_result, const PointVector &point, const T &threshold)
 {
     Matrix<T, NUM_MATCH_POINTS, 3> A;

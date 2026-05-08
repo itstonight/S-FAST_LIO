@@ -56,15 +56,15 @@ bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 
 vector<BoxPointType> cub_needrm;
-vector<PointVector> Nearest_Points;
+vector<PointVector> Nearest_Points;//存储近邻点
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
 deque<double> time_buffer;
 deque<PointCloudXYZI::Ptr> lidar_buffer;
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
 
-PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
-PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
+PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI()); // 局部地图点云
+PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI()); // 畸变纠正后的点云
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());  //畸变纠正后降采样的单帧点云，lidar系
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI()); //畸变纠正后降采样的单帧点云，W系
 
@@ -77,7 +77,7 @@ V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
 /*** EKF inputs and output ***/
-MeasureGroup Measures;
+MeasureGroup Measures; //打包好的LIDAR和IMU数据包
 
 esekfom::esekf kf;
 
@@ -185,7 +185,10 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 
 double lidar_mean_scantime = 0.0;
 int scan_num = 0;
-//把当前要处理的LIDAR和IMU数据打包到meas
+// 把当前要处理的LIDAR和IMU数据打包到meas中
+// 原理：
+// IMU的数据频率较雷达数据快，而雷达数据的点并不是瞬间采样，一个点一个点的接收累积的，因此每帧都一个时间区间
+// 通过得到最新的雷达数据的时间区间，然后根据时间区间，从IMU缓冲区中取出对应时间区间的IMU数据，保证IMU数据和雷达数据的时间同步
 bool sync_packages(MeasureGroup &meas)
 {
     if (lidar_buffer.empty() || imu_buffer.empty())
@@ -196,6 +199,7 @@ bool sync_packages(MeasureGroup &meas)
     /*** push a lidar scan ***/
     if (!lidar_pushed)
     {
+        // 获取雷达数据和时间戳
         meas.lidar = lidar_buffer.front();
         meas.lidar_beg_time = time_buffer.front();
         if (meas.lidar->points.size() <= 5) // time too little
@@ -207,10 +211,11 @@ bool sync_packages(MeasureGroup &meas)
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
         }
-        else
+        else // 正常情况
         {
             scan_num++;
             lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
+            // lidar_mean_scantime += (当前扫描时间 - 平均时间) / scan_num;
             lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;  //注意curvature中存储的是相对第一个点的时间
         }
 
@@ -219,7 +224,7 @@ bool sync_packages(MeasureGroup &meas)
         lidar_pushed = true;
     }
 
-    if (last_timestamp_imu < lidar_end_time)  //如果最新的imu时间戳都<雷达最终的时间，证明还没有收集足够的imu数据，break
+    if (last_timestamp_imu < lidar_end_time)  // 如果最新的imu时间戳都<雷达最终的时间，证明还没有收集足够的imu数据，break
     {
         return false;
     }
@@ -227,7 +232,7 @@ bool sync_packages(MeasureGroup &meas)
     /*** push imu data, and pop from imu buffer ***/
     double imu_time = imu_buffer.front()->header.stamp.toSec();
     meas.imu.clear();
-    while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
+    while ((!imu_buffer.empty()) && (imu_time < lidar_end_time)) // 循环读取IMU数据，把时间 ≤ lidar_end_time 的 IMU 全取出来
     {
         imu_time = imu_buffer.front()->header.stamp.toSec();
         if (imu_time > lidar_end_time)
@@ -617,7 +622,9 @@ int main(int argc, char **argv)
         if (sync_packages(Measures)) //把一次的IMU和LIDAR数据打包到Measures
         {
             double t00 = omp_get_wtime();
-
+            
+            // 丢弃第一帧，为什么？
+            // 因为IMU还没有准备好，并且没有历史信息，无法进行初始化
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
@@ -626,6 +633,7 @@ int main(int argc, char **argv)
                 continue;
             }
 
+            // 处理IMU数据，进行传播和去畸变
             p_imu1->Process(Measures, kf, feats_undistort);
 
             //如果feats_undistort为空 ROS_WARN
@@ -636,7 +644,7 @@ int main(int argc, char **argv)
             }
 
             state_point = kf.get_x();
-            pos_lid = state_point.pos + state_point.rot.matrix() * state_point.offset_T_L_I;
+            pos_lid = state_point.pos + state_point.rot.matrix() * state_point.offset_T_L_I; //lidar在世界坐标系下的位置
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
 
@@ -676,8 +684,9 @@ int main(int argc, char **argv)
                 // std::cout << "ikdtree size: " << featsFromMap->points.size() << std::endl;
             }
 
-            /*** iterated state estimation ***/
+            /*** iterated state estimation 迭代更新***/
             Nearest_Points.resize(feats_down_size); //存储近邻点的vector
+            // 迭代更新状态估计
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, feats_down_body, ikdtree, Nearest_Points, NUM_MAX_ITERATIONS, extrinsic_est_en);
 
             state_point = kf.get_x();

@@ -121,6 +121,7 @@ void ImuProcess::set_param(const V3D &transl, const M3D &rot, const V3D &gyr, co
 
 
 //IMU初始化：利用开始的IMU帧的平均值初始化状态量x
+//由此步骤可以明白，当系统启动时最好是静置
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, int &N)
 {
   //MeasureGroup这个struct表示当前过程中正在处理的所有数据，包含IMU队列和一帧lidar的点云 以及lidar的起始和结束时间
@@ -139,6 +140,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, in
     first_lidar_time = meas.lidar_beg_time;                   //将当前IMU帧对应的lidar起始时间 作为初始时间
   }
 
+  //使用递推的形式计算平均值和方差
   for (const auto &imu : meas.imu)    //根据所有IMU数据，计算平均值和方差
   {
     const auto &imu_acc = imu->linear_acceleration;
@@ -149,6 +151,18 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, in
     mean_acc  += (cur_acc - mean_acc) / N;    //根据当前帧和均值差作为均值的更新
     mean_gyr  += (cur_gyr - mean_gyr) / N;
 
+    // 更新加速度和角速度的方差
+    // 普通的方差是：Var = (1/N) Σ (xi - mean)^2
+    // 但是普通的方式需要存储历史数据且每次都要重新计算，在SLAM高频数据中明显不合适
+    // 所以采用在线更新的方式进行计算: var_old * (N-1)/N + (x - mean_new)^2 * (N-1)/(N^2)
+    // 公式推导思路：
+    // 1. 方差定义：var = (1/N) Σ (xi - mean)^2
+    // 2. 将新方差拆成：旧数据(N-1个) + 新数据(1个)
+    // 3. 对旧数据部分做变量替换：(xi - mean_new) = (xi - mean_old) + (mean_old - mean_new)
+    // 4. 展开平方后会出现三项，其中：Σ(xi - mean_old) = 0（均值性质） → 中间项会消失（正负偏差抵消）
+    // 5. 最终整理得到在线更新公式
+    // 为什么 FAST-LIO 没用更经典的 Welford 算法?
+    // 因为小样本数据Welford的优势体现不出来，而且Welford算法需要额外的变量存储，占用更多内存
     cov_acc = cov_acc * (N - 1.0) / N + (cur_acc - mean_acc).cwiseProduct(cur_acc - mean_acc)  / N;
     cov_gyr = cov_gyr * (N - 1.0) / N + (cur_gyr - mean_gyr).cwiseProduct(cur_gyr - mean_gyr)  / N / N * (N-1);
 
@@ -170,7 +184,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, in
   init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
   init_P(21,21) = init_P(22,22) = init_P(23,23) = 0.00001; 
   kf_state.change_P(init_P);
-  last_imu_ = meas.imu.back();
+  last_imu_ = meas.imu.back();//后续传播时会使用
 
   // std::cout << "IMU init new -- init_state  " << init_state.pos  <<" " << init_state.bg <<" " << init_state.ba <<" " << init_state.grav << std::endl;
 }
@@ -236,7 +250,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
 
-    kf_state.predict(dt, Q, in);    // IMU前向传播，每次传播的时间间隔为dt
+    kf_state.predict(dt, Q, in);    // IMU前向传播，每次传播的时间间隔为dt(状态量x和协方差P更新，对应论文公式(4和8))
 
     imu_state = kf_state.get_x();   //更新IMU状态为积分后的状态
     //更新上一帧角速度 = 后一帧角速度-bias  
@@ -263,7 +277,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
 
    /***消除每个激光雷达点的失真（反向传播）***/
   if (pcl_out.points.begin() == pcl_out.points.end()) return;
-  auto it_pcl = pcl_out.points.end() - 1;
+  auto it_pcl = pcl_out.points.end() - 1;// 最后一个点开始遍历
 
   //遍历每个IMU帧
   for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
@@ -289,8 +303,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
       
       V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);   //点所在时刻的位置(雷达坐标系下)
       V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);   //从点所在的世界位置-雷达末尾世界位置
+      //运动补偿之后的点坐标
       V3D P_compensate = imu_state.offset_R_L_I.matrix().transpose() * (imu_state.rot.matrix().transpose() * (R_i * (imu_state.offset_R_L_I.matrix() * P_i + imu_state.offset_T_L_I) + T_ei) - imu_state.offset_T_L_I);
 
+      //此处修改的就是pcl_out
       it_pcl->x = P_compensate(0);
       it_pcl->y = P_compensate(1);
       it_pcl->z = P_compensate(2);
